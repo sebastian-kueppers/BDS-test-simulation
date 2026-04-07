@@ -326,7 +326,13 @@ summary_df <- expand.grid(
 print(summary_df, n = 100)
 
 # We expect a rejection rate of 0.05 which is the alpha level of the test:
-mean(summary_df$rejection_rate) #0.04666667
+mean_rate <- mean(summary_df$rejection_rate)
+se_rate <- sd(summary_df$rejection_rate) / sqrt(nrow(summary_df))
+ci_lower <- mean_rate - 1.96 * se_rate
+ci_upper <- mean_rate + 1.96 * se_rate
+cat(sprintf("Rejection rate: %.2f%% (95%% CI: [%.2f%%, %.2f%%])\n",
+            mean_rate * 100, ci_lower * 100, ci_upper * 100))
+
 
 # Three-way ANOVA for main effect of any parameter 
 model <- aov(rejection_rate ~ T + Phi + Sigma, 
@@ -338,5 +344,6 @@ summary(model)
 # Phi          3 0.00050 0.0001667   0.362  0.781
 # Sigma        3 0.00148 0.0004944   1.074  0.365
 # Residuals   84 0.03867 0.0004603
+
 
 # rejection_rate does not vary over T, Phi, or Sigma
