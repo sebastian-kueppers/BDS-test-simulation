@@ -93,9 +93,8 @@ fit_ar1wn_residuals_parallel <- function(ts, uuid, emotion) {
 # Run parallel loop -------------
 
 start_time <- Sys.time()
-cat("Starting parallel processing...\n")
-cat("Start time:", format(start_time, "%Y-%m-%d %H:%M:%S"), "\n\n")
-# Single parallel call with progress bar
+
+# Single
 results_parallel <- task_data %>%
   mutate(
     result = future_pmap(
@@ -104,9 +103,12 @@ results_parallel <- task_data %>%
       .progress = TRUE
     )
   )
+
 end_time <- Sys.time()
 duration <- difftime(end_time, start_time, units = "mins")
 
+# Save
+saveRDS(results_parallel, file = "ARWN_results.rds")
 
 # # Setup progress bar and output data frame
 # total_iterations <- length(uuids.sub) * length(emotions)
