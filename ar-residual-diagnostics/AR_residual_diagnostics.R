@@ -169,7 +169,7 @@ log_message <- sprintf(
 cat(log_message, file = "log.txt", append = TRUE)
 
 # Save
-saveRDS(results_parallel, file = "ARWN_results_converge.rds")
+saveRDS(results_parallel, file = "ARWN_results_19-05.rds")
 
 plan(sequential)
 
