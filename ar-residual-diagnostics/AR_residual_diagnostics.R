@@ -16,6 +16,7 @@ library(FKF)
 library(foreign)
 library(rjags)
 library(coda)
+library(posterior)
 
 
 # set wd 
@@ -117,11 +118,15 @@ fit_ar1wn_residuals_parallel <- function(ts, uuid, emotion) {
       exclusion_reason <- "fewer than 3 response categories"
     }
     
-    # Frequentist
-    freq_result <- fit_ar1wn_residuals(ts, verbose = FALSE)
-
-    # Bayesian
-    bayes_result <- fit_ar1wn_residuals_bayesian(ts, verbose = FALSE)
+    freq_result  <- NULL
+    bayes_result <- NULL
+    
+    if (!excluded) {
+      # Frequentist
+      freq_result <- fit_ar1wn_residuals(ts, verbose = FALSE)
+      # Bayesian
+      bayes_result <- fit_ar1wn_residuals_bayesian(ts, verbose = TRUE)
+    }
 
     # Return both
     list(
@@ -158,6 +163,16 @@ results_parallel <- task_data %>%
     )
   )
 
+# test_results <- task_data %>%
+#   slice(1:3) %>%
+#   mutate(
+#     result = future_pmap(
+#       list(ts, uuid, emotion),
+#       fit_ar1wn_residuals_parallel,
+#       .progress = TRUE
+#     )
+#   )
+
 end_time <- Sys.time()
 duration <- difftime(end_time, start_time, units = "mins")
 
@@ -181,44 +196,31 @@ results <- readRDS("ARWN_results.rds")
 # CONVERGENCE AND HEYWOOD CASES ---
 ## --------------------------------
 
-bayes_null_idx <- c()
-bayes_null_uuids <- c()
+heywood_ivar <- c()
+heywood_evar <- c()
+bayes_convergence_failed <- c()
 
 for (i in 1:length(results$result)) {
+  freq <- results$result[[i]]$frequentist
   bayesian <- results$result[[i]]$bayesian
-  if (is.null(bayesian)) {
-    bayes_null_idx <- c(bayes_null_idx, i)
-    bayes_null_uuids <- c(bayes_null_uuids, results$uuid[[i]])
+  if (!is.null(bayesian)) {
+    bayes_convergence_failed <- c(bayes_convergence_failed, 
+                                  bayesian$convergence_failed)
   }
-    
+  
+  heywood_ivar <- c(heywood_ivar, freq$heywood_ivar)
+  heywood_evar <- c(heywood_evar, freq$heywood_evar)
 }
 
-length(bayes_null_idx) # 0
+sum(bayes_convergence_failed) # 360
 
-# ---> 20 rows with problems in Bayesian estimation. Can possibly be reduced by
-# ---> tweaking init parameters.
+# Bayesian estimations did not converge at all. Problem: estimations of ivar and
+# evar are highly correlated, with up to r = -.91.
 
-subset_results <- results[results$uuid %in% unique(bayes_null_uuids), ]
+sum(heywood_ivar | heywood_evar) # 181
 
+# 181/360 = 50% of frequentist estimations show Heywood cases ... 
 
-
-## --------------------------------
-# HEYWOOD CASES -------------------
-
-# Frequentist Heywood (any)
-freq_heywood_idx <- which(map_lgl(results$result, 
-                                  ~.$frequentist$heywood_ivar | .$frequentist$heywood_evar))
-length(freq_heywood_idx) # 219
-length(freq_heywood_idx) / nrow(results) # 0.608
-
-# Bayesian Heywood (any, only successful)
-bayes_heywood_idx <- which(map_lgl(results$result, 
-                                   ~!is.null(.$bayesian) && (.$bayesian$heywood_ivar | .$bayesian$heywood_evar)))
-
-length(bayes_heywood_idx) # 0
-
-# Check overlap between freq. Heywood cases and Bayes. failure
-overlap_idx <- intersect(freq_heywood_idx, bayes_null_idx)
 
 
 ## --------------------------------

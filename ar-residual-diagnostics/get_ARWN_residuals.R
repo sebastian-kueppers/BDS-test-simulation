@@ -203,30 +203,38 @@ fit_ar1wn_residuals_bayesian <- function(ts, verbose = FALSE,
     rhat_vals <- gd$psrf[, 1]
     rhat_ok <- all(rhat_vals < 1.05, na.rm = TRUE)
     
-    ess_vals <- effectiveSize(samples)
-    ess_ok <- all(ess_vals > (100 * n_chains), na.rm = TRUE)
+    draws <- as_draws_matrix(samples)
+    
+    # Bulk and tail ESS per parameter
+    bulk_ess <- ess_bulk(draws)
+    tail_ess <- ess_tail(draws)
+    
+    bulk_ok <- all(bulk_ess > 100 * n_chains, na.rm = TRUE)
+    tail_ok <- all(tail_ess > 100 * n_chains, na.rm = TRUE)
     
     return(list(
-      converged = rhat_ok & ess_ok,
-      max_rhat = max(rhat_vals, na.rm = TRUE),
-      min_ess = min(ess_vals, na.rm = TRUE)
+      converged    = rhat_ok & bulk_ok & tail_ok,
+      max_rhat     = max(rhat_vals, na.rm = TRUE),
+      min_bulk_ess = min(bulk_ess, na.rm = TRUE),
+      min_tail_ess = min(tail_ess, na.rm = TRUE)
     ))
   }
   
   # ========== Fit with Re-run Logic ==========
-  max_attempts <- 3
-  current_burnin <- n_burnin
-  current_samples <- n_samples
+  max_attempts       <- 3
+  current_burnin     <- n_burnin
+  current_samples    <- n_samples
   convergence_failed <- FALSE
-  samples_params <- NULL
-  conv_result <- NULL
-  error_message <- NULL
+  samples_params     <- NULL
+  conv_result        <- NULL
+  error_message      <- NULL
   
-  overall_result <- tryCatch({
+  for (attempt in 1:max_attempts) {
     
-    for (attempt in 1:max_attempts) {
-      
-      if (verbose) cat("Attempt", attempt, "| burnin =", current_burnin, "| samples =", current_samples, "\n")
+    if (verbose) cat("Attempt", attempt, "| burnin =", current_burnin, "| samples =", current_samples, "\n")
+    
+    # tryCatch wraps only the JAGS calls
+    fit_result <- tryCatch({
       
       jags_model <- jags.model(
         file = model_file,
@@ -241,49 +249,56 @@ fit_ar1wn_residuals_bayesian <- function(ts, verbose = FALSE,
              progress.bar = ifelse(verbose, "text", "none"))
       
       if (verbose) cat("Sampling from posterior...\n")
-      samps <- coda.samples(
+      coda.samples(
         jags_model,
         variable.names = c("mu", "Ivar", "Evar", "phi", "ytilde"),
         n.iter = current_samples,
         progress.bar = ifelse(verbose, "text", "none")
       )
       
-      key_params <- c("mu", "Ivar", "Evar", "phi")
-      samps_key <- samps[, key_params]
-      conv_result <<- check_convergence(samps_key)
-      
-      if (verbose) {
-        cat("Max R-hat:", round(conv_result$max_rhat, 3), "\n")
-        cat("Min ESS:", round(conv_result$min_ess, 1), "\n")
-        cat("Converged:", conv_result$converged, "\n\n")
-      }
-      
-      if (conv_result$converged) {
-        samples_params <<- samps
-        break
-      }
-      
-      if (attempt < max_attempts) {
-        current_burnin <<- current_burnin * 2
-        current_samples <<- current_samples * 2
-        if (verbose) cat("Convergence not reached. Doubling iterations...\n\n")
-      } else {
-        convergence_failed <<- TRUE
-        samples_params <<- samps
-        if (verbose) cat("Convergence criteria not met after", max_attempts, "attempts.\n")
-      }
+    }, error = function(e) {
+      error_message <<- e$message
+      if (verbose) cat("Error in JAGS fitting:", e$message, "\n")
+      NULL
+    })
+    
+    # JAGS itself failed — no point retrying
+    if (is.null(fit_result)) {
+      convergence_failed <- TRUE
+      break
     }
     
-    NULL  # no error
+    # Convergence check — plain <- works fine here (outside tryCatch)
+    key_params  <- c("mu", "Ivar", "Evar", "phi")
+    samps_key   <- fit_result[, key_params]
+    conv_result <- check_convergence(samps_key)
     
-  }, error = function(e) {
-    error_message <<- e$message
-    if (verbose) cat("Error in JAGS fitting:", e$message, "\n")
-    return("error")
-  })
+    if (verbose) {
+      cat("Max R-hat:", round(conv_result$max_rhat, 3), "\n")
+      cat("Min min_bulk_ess:",   round(conv_result$min_bulk_ess,  1), "\n")
+      cat("Min tail_ess:",   round(conv_result$min_tail_ess,  1), "\n")
+      cat("Converged:", conv_result$converged, "\n\n")
+    }
+    
+    if (conv_result$converged) {
+      samples_params <- fit_result
+      break
+    }
+    
+    # Not converged
+    if (attempt < max_attempts) {
+      current_burnin  <- current_burnin  * 2
+      current_samples <- current_samples * 2
+      if (verbose) cat("Convergence not reached. Doubling iterations...\n\n")
+    } else {
+      convergence_failed <- TRUE
+      samples_params     <- fit_result  # keep for inspection
+      if (verbose) cat("Convergence criteria not met after", max_attempts, "attempts.\n")
+    }
+  }
   
-  # ========== Early exit on error ==========
-  if (!is.null(overall_result) && overall_result == "error") {
+  # ========== Early exit if JAGS failed entirely ==========
+  if (is.null(samples_params)) {
     return(list(
       innovations        = NULL,
       latent_residuals   = NULL,
@@ -291,7 +306,8 @@ fit_ar1wn_residuals_bayesian <- function(ts, verbose = FALSE,
       convergence_failed = TRUE,
       error_message      = error_message,
       max_rhat           = NA,
-      min_ess            = NA,
+      min_ess_bulk       = NA,
+      min_ess_tail       = NA,
       final_burnin       = current_burnin,
       final_samples      = current_samples
     ))
@@ -308,14 +324,13 @@ fit_ar1wn_residuals_bayesian <- function(ts, verbose = FALSE,
   heywood_ivar <- ivar_est < 1e-6
   heywood_evar <- evar_est < 1e-6
   
-  ytilde_cols <- grep("^ytilde\\[", colnames(samples_matrix))
+  ytilde_cols           <- grep("^ytilde\\[", colnames(samples_matrix))
   ytilde_posterior_mean <- colMeans(samples_matrix[, ytilde_cols])
   
-  # Innovations: what cannot be explained by AR(1) or measurement error
-  # ytilde[t] - phi * ytilde[t-1], defined for t = 2, ..., T
+  # Innovations: ytilde[t] - phi * ytilde[t-1], defined for t = 2, ..., T
   innovations <- ytilde_posterior_mean[-1] - phi_est * ytilde_posterior_mean[-length(ytilde_posterior_mean)]
   
-  # Full latent process (AR(1) + innovations, measurement-error-free)
+  # Measurement-error-free latent process
   latent_residuals  <- ytilde_posterior_mean
   # Measurement error
   measurement_error <- ts - mu_est - ytilde_posterior_mean
@@ -328,9 +343,9 @@ fit_ar1wn_residuals_bayesian <- function(ts, verbose = FALSE,
   gc()
   
   return(list(
-    innovations        = innovations,       # pure unexpected perturbations (length T-1)
-    latent_residuals   = latent_residuals,  # measurement-error-free latent process (length T)
-    measurement_error  = measurement_error, # Evar component (length T)
+    innovations        = innovations,
+    latent_residuals   = latent_residuals,
+    measurement_error  = measurement_error,
     mu                 = mu_est,
     phi                = phi_est,
     ivar               = ivar_est,
@@ -340,7 +355,8 @@ fit_ar1wn_residuals_bayesian <- function(ts, verbose = FALSE,
     convergence_failed = convergence_failed,
     error_message      = error_message,
     max_rhat           = if (!is.null(conv_result)) conv_result$max_rhat else NA,
-    min_ess            = if (!is.null(conv_result)) conv_result$min_ess else NA,
+    min_bulk_ess       = if (!is.null(conv_result)) conv_result$min_bulk_ess else NA,
+    min_tail_ess       = if (!is.null(conv_result)) conv_result$min_tail_ess else NA,
     final_burnin       = current_burnin,
     final_samples      = current_samples
   ))
