@@ -163,11 +163,12 @@ fit_ar1wn_residuals <- function(ts, verbose = FALSE) {
 
 
 fit_ar1wn_residuals_bayesian <- function(ts, verbose = FALSE, 
-                                         n_burnin = 40000, 
-                                         n_samples = 40000,
+                                         n_burnin = 2000, 
+                                         n_samples = 5000,
                                          n_chains = 3) {
   
   nt <- length(ts)
+  obs_mean <- mean(ts, na.rm = TRUE)
   
   model_code <- "
   model {
@@ -177,13 +178,13 @@ fit_ar1wn_residuals_bayesian <- function(ts, verbose = FALSE,
       ytilde[t] ~ dnorm(muytilde[t], Ipre)
       muytilde[t] <- phi * ytilde[t-1]
     }
-    ytilde[1] <- y[1] - mu
+    ytilde[1] ~ dnorm(0, Ipre)
     Epre <- 1 / Evar
     Evar ~ dunif(0, 500)
     Ipre <- 1 / Ivar
     Ivar ~ dunif(0, 500)
     phi ~ dunif(-1, 1)
-    mu ~ dnorm(50, 0.001)
+    mu ~ dnorm(obs_mean, 0.001)
   }
   "
   
@@ -191,70 +192,156 @@ fit_ar1wn_residuals_bayesian <- function(ts, verbose = FALSE,
   writeLines(model_code, model_file)
   
   inits <- list(
-    list(phi = 0.6, mu = 50, Ivar = 30, Evar = 20),
-    list(phi = 0.3, mu = 70, Ivar = 60, Evar = 40),
-    list(phi = -0.2, mu = 80, Ivar = 20, Evar = 30)
+    list(phi = 0.6, mu = obs_mean, Ivar = 30, Evar = 20),
+    list(phi = 0.3, mu = obs_mean, Ivar = 60, Evar = 40),
+    list(phi = -0.2, mu = obs_mean, Ivar = 20, Evar = 30)
   )
   
-  tryCatch({
-    jags_model <- jags.model(
-      file = model_file,
-      data = list(y = ts, nt = nt),
-      inits = inits,
-      n.chains = n_chains,
-      quiet = !verbose
-    )
+  # ========== Convergence Check Function ==========
+  check_convergence <- function(samples) {
+    gd <- gelman.diag(samples, multivariate = FALSE)
+    rhat_vals <- gd$psrf[, 1]
+    rhat_ok <- all(rhat_vals < 1.05, na.rm = TRUE)
     
-    if (verbose) cat("Running burnin...\n")
-    update(jags_model, n.iter = n_burnin, progress.bar = ifelse(verbose, "text", "none"))
+    ess_vals <- effectiveSize(samples)
+    ess_ok <- all(ess_vals > (100 * n_chains), na.rm = TRUE)
     
-    # Sample mu, Ivar, and Evar (needed for residuals and Heywood check)
-    if (verbose) cat("Sampling from posterior...\n")
-    samples_params <- coda.samples(
-      jags_model,
-      variable.names = c("mu", "Ivar", "Evar", "ytilde"),
-      n.iter = n_samples,
-      progress.bar = ifelse(verbose, "text", "none")
-    )
-    
-    # ========== Extract Only What You Need ==========
-    samples_matrix <- as.matrix(samples_params)
-    
-    # Get posterior means
-    mu_est <- mean(samples_matrix[, "mu"])
-    ivar_est <- mean(samples_matrix[, "Ivar"])
-    evar_est <- mean(samples_matrix[, "Evar"])
-    
-    # Check Heywood cases
-    heywood_ivar <- ivar_est < 1e-6
-    heywood_evar <- evar_est < 1e-6
-    
-    # Extract latent states
-    ytilde_cols <- grep("^ytilde\\[", colnames(samples_matrix))
-    ytilde_posterior_mean <- colMeans(samples_matrix[, ytilde_cols])
-    
-    # Compute residuals
-    measurement_residuals <- ts - mu_est - ytilde_posterior_mean
-    
-    # Remove names to match frequentist format
-    names(measurement_residuals) <- NULL
-    
-    # Clean up
-    rm(samples_matrix)
-    gc()
-    
-    # ========== Return Results ==========
     return(list(
-      residuals = measurement_residuals,
-      mu = mu_est,
-      ivar = ivar_est,
-      evar = evar_est,
-      heywood_ivar = heywood_ivar,
-      heywood_evar = heywood_evar
+      converged = rhat_ok & ess_ok,
+      max_rhat = max(rhat_vals, na.rm = TRUE),
+      min_ess = min(ess_vals, na.rm = TRUE)
     ))
+  }
+  
+  # ========== Fit with Re-run Logic ==========
+  max_attempts <- 3
+  current_burnin <- n_burnin
+  current_samples <- n_samples
+  convergence_failed <- FALSE
+  samples_params <- NULL
+  conv_result <- NULL
+  error_message <- NULL
+  
+  overall_result <- tryCatch({
+    
+    for (attempt in 1:max_attempts) {
+      
+      if (verbose) cat("Attempt", attempt, "| burnin =", current_burnin, "| samples =", current_samples, "\n")
+      
+      jags_model <- jags.model(
+        file = model_file,
+        data = list(y = ts, nt = nt, obs_mean = obs_mean),
+        inits = inits,
+        n.chains = n_chains,
+        quiet = !verbose
+      )
+      
+      if (verbose) cat("Running burnin...\n")
+      update(jags_model, n.iter = current_burnin,
+             progress.bar = ifelse(verbose, "text", "none"))
+      
+      if (verbose) cat("Sampling from posterior...\n")
+      samps <- coda.samples(
+        jags_model,
+        variable.names = c("mu", "Ivar", "Evar", "phi", "ytilde"),
+        n.iter = current_samples,
+        progress.bar = ifelse(verbose, "text", "none")
+      )
+      
+      key_params <- c("mu", "Ivar", "Evar", "phi")
+      samps_key <- samps[, key_params]
+      conv_result <<- check_convergence(samps_key)
+      
+      if (verbose) {
+        cat("Max R-hat:", round(conv_result$max_rhat, 3), "\n")
+        cat("Min ESS:", round(conv_result$min_ess, 1), "\n")
+        cat("Converged:", conv_result$converged, "\n\n")
+      }
+      
+      if (conv_result$converged) {
+        samples_params <<- samps
+        break
+      }
+      
+      if (attempt < max_attempts) {
+        current_burnin <<- current_burnin * 2
+        current_samples <<- current_samples * 2
+        if (verbose) cat("Convergence not reached. Doubling iterations...\n\n")
+      } else {
+        convergence_failed <<- TRUE
+        samples_params <<- samps
+        if (verbose) cat("Convergence criteria not met after", max_attempts, "attempts.\n")
+      }
+    }
+    
+    NULL  # no error
     
   }, error = function(e) {
-    cat("Error in Bayesian AR(1)+WN fitting:", e$message, "\n")
-    return(NULL)
+    error_message <<- e$message
+    if (verbose) cat("Error in JAGS fitting:", e$message, "\n")
+    return("error")
   })
+  
+  # ========== Early exit on error ==========
+  if (!is.null(overall_result) && overall_result == "error") {
+    return(list(
+      innovations        = NULL,
+      latent_residuals   = NULL,
+      measurement_error  = NULL,
+      convergence_failed = TRUE,
+      error_message      = error_message,
+      max_rhat           = NA,
+      min_ess            = NA,
+      final_burnin       = current_burnin,
+      final_samples      = current_samples
+    ))
+  }
+  
+  # ========== Extract Results ==========
+  samples_matrix <- as.matrix(samples_params)
+  
+  mu_est   <- mean(samples_matrix[, "mu"])
+  phi_est  <- mean(samples_matrix[, "phi"])
+  ivar_est <- mean(samples_matrix[, "Ivar"])
+  evar_est <- mean(samples_matrix[, "Evar"])
+  
+  heywood_ivar <- ivar_est < 1e-6
+  heywood_evar <- evar_est < 1e-6
+  
+  ytilde_cols <- grep("^ytilde\\[", colnames(samples_matrix))
+  ytilde_posterior_mean <- colMeans(samples_matrix[, ytilde_cols])
+  
+  # Innovations: what cannot be explained by AR(1) or measurement error
+  # ytilde[t] - phi * ytilde[t-1], defined for t = 2, ..., T
+  innovations <- ytilde_posterior_mean[-1] - phi_est * ytilde_posterior_mean[-length(ytilde_posterior_mean)]
+  
+  # Full latent process (AR(1) + innovations, measurement-error-free)
+  latent_residuals  <- ytilde_posterior_mean
+  # Measurement error
+  measurement_error <- ts - mu_est - ytilde_posterior_mean
+  
+  names(innovations)       <- NULL
+  names(latent_residuals)  <- NULL
+  names(measurement_error) <- NULL
+  
+  rm(samples_matrix)
+  gc()
+  
+  return(list(
+    innovations        = innovations,       # pure unexpected perturbations (length T-1)
+    latent_residuals   = latent_residuals,  # measurement-error-free latent process (length T)
+    measurement_error  = measurement_error, # Evar component (length T)
+    mu                 = mu_est,
+    phi                = phi_est,
+    ivar               = ivar_est,
+    evar               = evar_est,
+    heywood_ivar       = heywood_ivar,
+    heywood_evar       = heywood_evar,
+    convergence_failed = convergence_failed,
+    error_message      = error_message,
+    max_rhat           = if (!is.null(conv_result)) conv_result$max_rhat else NA,
+    min_ess            = if (!is.null(conv_result)) conv_result$min_ess else NA,
+    final_burnin       = current_burnin,
+    final_samples      = current_samples
+  ))
 }
