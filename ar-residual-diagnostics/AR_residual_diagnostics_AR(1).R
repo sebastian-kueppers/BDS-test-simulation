@@ -1,11 +1,10 @@
-
-#####################################
-### AR RESIDUAL DIAGNOSTICS #########
-#####################################
+## --------------------------------
+# AR RESIDUAL DIAGNOSTICS ---------
+## --------------------------------
 
 library(dplyr)
 library(FKF)
-library(tseries) 
+library(tseries)
 library(tidyverse)
 library(future)
 library(furrr)
@@ -17,19 +16,23 @@ library(foreign)
 library(rjags)
 library(coda)
 library(posterior)
+library(lme4)
+library(mgcv)
+library(rEDM)
 
 
-# set wd 
+# set wd
 # setwd("...")
 setwd("C:/Users/Sebastian Küppers/Desktop/Formal Theory of Co-Occuring Emotions (DFG project)/_PhD/_PhD_Study_1/Research Exchange/PROJECT/Preregistration/github/ar-residual-diagnostics")
 
+# Data can be given out on request!
 # load data
 data <- read.csv("data_FEEL_Study_1.csv")
 
 # get helper function
 source("get_ARWN_residuals.R")
 source("HELPER_EDM_tests.R")
-
+source("bootstrap_BDS.R")
 
 # get all uuids
 uuids <- unique(data$UUID) # 179 participants
@@ -47,16 +50,16 @@ data.sub <- data[data$UUID %in% uuids.sub, ]
 
 # get affect items
 items.neg <- c("ANG_ES", "SAD_ES", "STR_ES")
-items.pos <- c("CONF_ES", "HAP_ES", "RLX_ES") 
-emotions <- c(items.pos, items.neg) 
+items.pos <- c("CONF_ES", "HAP_ES", "RLX_ES")
+emotions <- c(items.pos, items.neg)
 
 ## --------------------------------
 # PROCEDURE -----------------------
 ## --------------------------------
 
 ## --------------------------------
-# Setup parallel ------------------
-# 
+# Setup Parallel ------------------
+
 n_cores <- availableCores() - 1
 plan(multisession, workers = n_cores)
 
@@ -74,9 +77,9 @@ task_data <- expand_grid(
     
     # with overnight lag:
     ts = map2(uuid, emotion, function(u, e) {
-      temp <- data.sub %>% 
+      temp <- data.sub %>%
         filter(UUID == u) %>%
-        arrange(Date_Local, Time_Local) 
+        arrange(Date_Local, Time_Local)
       
       y <- temp[[e]]
       dates <- temp$Date_Local
@@ -96,229 +99,153 @@ task_data <- expand_grid(
 # Some descriptives
 # n_mean <- mean(map_dbl(task_data$ts, length)) # 163.5139
 
-## -------------------------------
-# Helper function ----------------
-
-fit_ar1wn_residuals_parallel <- function(ts, uuid, emotion) {
-  tryCatch({
-    
-    # Check inclusion criteria (flag only, do not skip analysis)
-    ts_complete <- ts[!is.na(ts)]
-    excluded <- FALSE
-    exclusion_reason <- NA
-    
-    if (length(ts_complete) < 50) {
-      excluded <- TRUE
-      exclusion_reason <- "fewer than 50 complete observations"
-    } else if (sd(ts_complete) == 0) {
-      excluded <- TRUE
-      exclusion_reason <- "SD = 0"
-    } else if (length(unique(ts_complete)) < 3) {
-      excluded <- TRUE
-      exclusion_reason <- "fewer than 3 response categories"
-    }
-    
-    freq_result  <- NULL
-    bayes_result <- NULL
-    
-    if (!excluded) {
-      # Frequentist
-      freq_result <- fit_ar1wn_residuals(ts, verbose = FALSE)
-      # Bayesian
-      bayes_result <- fit_ar1wn_residuals_bayesian(ts, verbose = TRUE)
-    }
-
-    # Return both
-    list(
-      uuid = uuid,
-      emotion = emotion,
-      frequentist = freq_result,
-      bayesian = bayes_result,
-      excluded = excluded,
-      excusion_reason = exclusion_reason,
-      success = TRUE
-    )
-  }, error = function(e) {
-    list(
-      uuid = uuid,
-      emotion = emotion,
-      error = e$message,
-      success = FALSE
-    )
-  })
-}
-
-## ------------------------------
-# Run parallel loop -------------
-
-start_time <- Sys.time()
-
-# Single
-results_parallel <- task_data %>%
-  mutate(
-    result = future_pmap(
-      list(ts, uuid, emotion),
-      fit_ar1wn_residuals_parallel,
-      .progress = TRUE
-    )
-  )
-
-# test_results <- task_data %>%
-#   slice(1:3) %>%
-#   mutate(
-#     result = future_pmap(
-#       list(ts, uuid, emotion),
-#       fit_ar1wn_residuals_parallel,
-#       .progress = TRUE
-#     )
-#   )
-
-end_time <- Sys.time()
-duration <- difftime(end_time, start_time, units = "mins")
-
-log_message <- sprintf(
-  "[%s] Dauer: %.2f Minuten\n",
-  format(Sys.time(), "%Y-%m-%d %H:%M:%S"),
-  as.numeric(duration)
-)
-cat(log_message, file = "log.txt", append = TRUE)
-
-# Save
-saveRDS(results_parallel, file = "ARWN_results_19-05.rds")
-
-plan(sequential)
-
-
-# Read data
-results <- readRDS("ARWN_results.rds")
-
 ## --------------------------------
-# CONVERGENCE AND HEYWOOD CASES ---
-## --------------------------------
+# Run BDS Testing Procedure -------
 
-heywood_ivar <- c()
-heywood_evar <- c()
-bayes_convergence_failed <- c()
-
-for (i in 1:length(results$result)) {
-  freq <- results$result[[i]]$frequentist
-  bayesian <- results$result[[i]]$bayesian
-  if (!is.null(bayesian)) {
-    bayes_convergence_failed <- c(bayes_convergence_failed, 
-                                  bayesian$convergence_failed)
-  }
-  
-  heywood_ivar <- c(heywood_ivar, freq$heywood_ivar)
-  heywood_evar <- c(heywood_evar, freq$heywood_evar)
-}
-
-sum(bayes_convergence_failed) # 360
-
-# Bayesian estimations did not converge at all. Problem: estimations of ivar and
-# evar are highly correlated, with up to r = -.91.
-
-sum(heywood_ivar | heywood_evar) # 181
-
-# 181/360 = 50% of frequentist estimations show Heywood cases ... 
-
-
-
-## --------------------------------
-# ANALYSIS ------------------------
-## --------------------------------
-
-source("bootstrap_BDS.R")
-
-# Excluding freq. Heywood cases likely introduces a selection bias because time
-# series with lower AR effect are known to produce more such cases (Schuurman et al., 2015)
-
-# Hence, we will continue with Bayesian cases that did not fail in estimation.
-
-# Filter to only successful Bayesian fits
-valid_results <- results %>%
-  mutate(
-    has_bayesian = map_lgl(result, ~!is.null(.$bayesian))
-  ) %>%
-  filter(has_bayesian)
-
-# Initialize empty list
 BDS_results <- list()
 
-# Run BDS tests sequentially with progress bar
-n_total <- nrow(valid_results)
+pb <- txtProgressBar(min = 0, max = nrow(task_data), style = 3)
+pb_count <- 0
 
-for (i in 1:n_total) {
-  uuid <- valid_results$uuid[i]
-  emotion <- valid_results$emotion[i]
-  ts <- valid_results$ts[i]
-  residuals <- valid_results$result[[i]]$bayesian$residuals
+set.seed(2310)
+
+for (i in 1:nrow(task_data)) {
+  uuid <- task_data$uuid[i]
+  emotion <- task_data$emotion[i]
+  ts <- task_data$ts[i][[1]]
   
-  bds_result <- bds_test_bootstrap(residuals)
+  ts_complete <- ts[!is.na(ts)]
+  excluded <- FALSE
+  exclusion_reason <- NA
   
-  # control: BDS result without controlling for measurement error
-  ar.fit <- arima(ts[[1]], order = c(1, 0, 0))
+  if (length(ts_complete) < 50) {
+    excluded <- TRUE
+    exclusion_reason <- "fewer than 50 complete observations"
+  } else if (sd(ts_complete) == 0) {
+    excluded <- TRUE
+    exclusion_reason <- "SD = 0"
+  } else if (length(unique(ts_complete)) < 3) {
+    excluded <- TRUE
+    exclusion_reason <- "fewer than 3 response categories"
+  }
+  
+  ar.fit <- arima(ts, order = c(1, 0, 0))
   ar.res <- residuals(ar.fit)
-  bds_result_w_me <- bds_test_bootstrap(ar.res)
+  ar.res.wo.na <- ar.res[!is.na(ar.res)]
+  bds_result_w_me <- bds_test_bootstrap(ar.res.wo.na)
   
   BDS_results[[i]] <- list(
     uuid = uuid,
     emotion = emotion,
     ts = ts,
-    bds_result = bds_result,
-    bds_result_w_me = bds_result_w_me
+    bds_result_w_me = bds_result_w_me,
+    bds_statistic = bds_result_w_me$bds_statistic,
+    bds_pvalue_parametric = bds_result_w_me$bds_pvalue_parametric,
+    bds_pvalue_empirical = bds_result_w_me$bds_pvalue_empirical,
+    residuals = ar.res,
+    excluded = excluded,
+    exclusion_reason = exclusion_reason
   )
   
-  # Print progress
-  cat("\r", sprintf("Progress: %d/%d (%.1f%%)", i, n_total, i/n_total*100), sep = "")
-  flush.console()
+  pb_count <- pb_count + 1
+  setTxtProgressBar(pb, pb_count)
 }
 
-cat("\n")  # New line after progress bar
+
+# Save
+saveRDS(BDS_results, file = "BDS_results_AR_02-06.rds")
+
+# Read data
+BDS_results <- readRDS("BDS_results_AR_02-06.rds")
+
 
 # Convert to tibble
-BDS_results <- map_df(BDS_results, ~tibble(
+BDS_results.tibble <- map_df(BDS_results, ~tibble(
   uuid = .$uuid,
   emotion = .$emotion,
-  bds_result = list(.$bds_result),
+  excluded = .$excluded,
+  exclusion_reason = .$exclusion_reason,
   bds_result_w_me = list(.$bds_result_w_me)
 ))
 
+# Proportion of time series failing inclusion criteria
+mean(BDS_results.tibble$excluded) # 0 -> all meet criteria
+
 # Proportion of significant BDS tests
-prop_sig <- mean(map_dbl(BDS_results$bds_result, ~.$bds_pvalue_empirical) < 0.05) #0.5444
-prop_sig_w_me <- mean(map_dbl(BDS_results$bds_result_w_me, ~.$bds_pvalue_empirical) < 0.05) #0.503
+mean(map_dbl(BDS_results.tibble$bds_result_w_me, ~.$bds_pvalue_empirical) < 0.05) #0.488129
 
 
 # Check per participant
 # Extract p-values and add to BDS_results
-BDS_results_with_pval <- BDS_results %>%
+BDS_results_with_pval <- BDS_results.tibble %>%
   mutate(
-    bds_pvalue_empirical = map_dbl(bds_result, ~.$bds_pvalue_empirical),
+    bds_pvalue_empirical = map_dbl(bds_result_w_me, ~.$bds_pvalue_empirical),
     significant = bds_pvalue_empirical < 0.05,
-    bds_pvalue_empirical_w_me = map_dbl(bds_result_w_me, ~.$bds_pvalue_empirical),
-    significant_w_me = bds_pvalue_empirical_w_me < 0.05
   )
 
-# Does controlling for measurement error have an effect on BDS results?
-table(BDS_results_with_pval$significant, 
-      BDS_results_with_pval$significant_w_me)
 
-#       FALSE TRUE
-# FALSE   145   17
-# TRUE     35  163
+## --------------------------------
+# Summary by UUID and Valence -----
 
-# ========== Summary by UUID ==========
-bds_by_uuid <- BDS_results_with_pval %>%
-  group_by(uuid) %>%
+emotion_valence <- tibble(
+  emotion = c(items.pos, items.neg),
+  valence  = c(rep("positive", length(items.pos)),
+               rep("negative", length(items.neg)))
+)
+
+# Join and summary
+bds_by_valence <- BDS_results_with_pval %>%
+  left_join(emotion_valence, by = "emotion") %>%
+  group_by(valence) %>%
   summarise(
-    n_emotions = n(),
-    n_significant = sum(significant),
-    prop_significant = n_significant / n_emotions,
+    n_emotions      = n(),
+    n_significant   = sum(significant),
+    prop_significant = mean(significant),
     .groups = "drop"
-  ) %>%
-  arrange(desc(prop_significant))
+  )
 
-mean(bds_by_uuid$n_significant) # 3.266667
-sd(bds_by_uuid$n_significant) # 1.725842
+bds_by_valence
+
+BDS_results_with_pval %>%
+  left_join(emotion_valence, by = "emotion") %>%
+  glmer(significant ~ valence + (1 | uuid),
+        data   = .,
+        family = binomial) %>%
+  summary()
+
+bds_by_uuid_valence <- BDS_results_with_pval %>%
+  left_join(emotion_valence, by = "emotion") %>%
+  group_by(uuid, valence) %>%
+  summarise(
+    n_significant    = sum(significant),
+    prop_significant = mean(significant),
+    .groups = "drop"
+  )
+
+BDS_results_with_pval %>%
+  group_by(uuid) %>%
+  summarise(n_significant = sum(significant)) %>%
+  summarise(
+    mean_n_significant = mean(n_significant),
+    sd_n_significant   = sd(n_significant)
+  )
+# mean_n_significant sd_n_significant
+# <dbl>            <dbl>
+#   1               2.93             1.73
+
+bds_by_uuid_valence %>%
+  group_by(valence) %>%
+  summarise(
+    mean_n_significant   = mean(n_significant),
+    sd_n_significant     = sd(n_significant),
+    mean_prop_significant = mean(prop_significant),
+    sd_prop_significant   = sd(prop_significant)
+  )
+
+# valence  mean_n_significant sd_n_significant mean_prop_significant sd_prop_significant
+# <chr>                 <dbl>            <dbl>                 <dbl>               <dbl>
+#   1 negative               1.55            0.946                 0.517               0.315
+# 2 positive               1.38            1.06                  0.461               0.353
 
 
 ## --------------------------------
@@ -329,16 +256,15 @@ results_diag <- list()
 results_complex <- list()
 
 # Loop over results
-for (i in seq_len(nrow(results))) {
+for (i in 1:nrow(task_data)) {
   print(i)
   
-  # Extract key information
-  uuid <- results$uuid[i]
-  emotion <- results$emotion[i]
-  ts <- results$ts[i]
+  uuid <- task_data$uuid[i]
+  emotion <- task_data$emotion[i]
+  ts <- task_data$ts[i][[1]]
   
   # Extract residuals
-  residuals_ts <- results$result[[i]]$bayesian$residuals
+  residuals_ts <- BDS_results[[i]]$residuals
   
   # Extract BDS result
   bds_match <- BDS_results_with_pval %>%
@@ -355,132 +281,130 @@ for (i in seq_len(nrow(results))) {
     next
   }
   
-  # Create time index
-  time_idx <- 1:length(residuals_ts)
+  ## --------------------------------
+  # GAM Modelling (Raw TS) ----------
   
-  # ========== GAM MODELLING ==========
+  ts_complete <- ts[!is.na(ts)]
   
-  # Create lagged residuals
-  residuals_df <- data.frame(
-    residuals = residuals_ts,
-    residuals_lag = c(NA, residuals_ts[-length(residuals_ts)]),
-    time = time_idx
-  )
-  
-  # Remove NA rows
-  residuals_df <- residuals_df %>% filter(!is.na(residuals_lag))
+  ts_df <- data.frame(
+    ts      = ts_complete,
+    ts_lag  = c(NA, ts_complete[-length(ts_complete)]),
+    time    = 1:length(ts_complete)
+  ) %>% filter(!is.na(ts_lag))
   
   edf.lag <- NA
-  edf.t <- NA
+  edf.t   <- NA
   
   tryCatch({
-    gam.lag <- gam(residuals ~ s(residuals_lag, bs = "tp", k = 10), 
-                   method = "ML", data = residuals_df)
+    gam.lag <- gam(ts ~ s(ts_lag, bs = "tp", k = 10),
+                   method = "ML", data = ts_df)
     edf.lag <- summary(gam.lag)$edf
   }, error = function(e) {
     message(paste("GAM lag error for", uuid, ":", e$message))
   })
   
   tryCatch({
-    gam.t <- gam(residuals ~ s(time, bs = "tp", k = 10), 
-                 method = "ML", data = residuals_df)
+    gam.t <- gam(ts ~ s(time, bs = "tp", k = 10),
+                 method = "ML", data = ts_df)
     edf.t <- summary(gam.t)$edf
   }, error = function(e) {
     message(paste("GAM time error for", uuid, ":", e$message))
   })
   
-  # ========== S-MAP ANALYSIS (EDM) ==========
+  ## --------------------------------
+  # S-Map Analysis (EDM) ------------
   
-  E_opt <- NA
+  E_opt     <- NA
   theta_opt <- NA
   
   tryCatch({
-    edm <- EDM_tests(data.frame(residuals = residuals_ts), 
+    edm <- EDM_tests(data.frame(residuals = ts),
                      EDM.include = c("E_opt", "SMap"))
-    E_opt <- edm["E_opt", "residuals"]
+    E_opt     <- edm["E_opt",     "residuals"]
     theta_opt <- edm["theta_opt", "residuals"]
   }, error = function(e) {
     message(paste("EDM error for", uuid, ":", e$message))
   })
   
-  # ========== LJUNG-BOX TEST ==========
+  ## --------------------------------
+  # Ljung-Box Test ------------------
   
   ljung_box.p <- NA
   
   tryCatch({
-    ljung_box <- Box.test(residuals_ts, lag = 10, type = "Ljung-Box")
+    ljung_box   <- Box.test(residuals_ts, lag = 10, type = "Ljung-Box")
     ljung_box.p <- ljung_box$p.value
   }, error = function(e) {
     message(paste("Ljung-Box error for", uuid, ":", e$message))
   })
   
-  # ========== ARCH LM TEST ==========
+  ## --------------------------------
+  # ARCH LM Test --------------------
   
   arch_lm.p <- NA
   
   tryCatch({
-    arch_lm <- ArchTest(residuals_ts, lags = 10)
-    arch_lm.p <- arch_lm$p.value
+    residuals_clean <- residuals_ts[!is.na(residuals_ts)]
+    n_lags <- 10
+    if (length(residuals_clean) > n_lags + 5) {
+      arch_lm   <- ArchTest(residuals_clean, lags = n_lags)
+      arch_lm.p <- arch_lm$p.value
+    }
   }, error = function(e) {
     message(paste("ARCH LM error for", uuid, ":", e$message))
   })
   
-  # ========== SHAPIRO-WILK TEST ==========
+  ## --------------------------------
+  # Shapiro-Wilk Test ---------------
   
   shapiro_wilk.p <- NA
   
   tryCatch({
-    shapiro_wilk <- shapiro.test(residuals_ts)
+    shapiro_wilk   <- shapiro.test(residuals_ts)
     shapiro_wilk.p <- shapiro_wilk$p.value
   }, error = function(e) {
     message(paste("Shapiro-Wilk error for", uuid, ":", e$message))
   })
   
-  # ========== CHANGE POINT ANALYSIS ==========
+  ## --------------------------------
+  # Change Point Analysis (Raw TS) --
   
   changepoint.n <- NA
   
   tryCatch({
-    alpha <- 0.05
-    R <- ceiling(20 / alpha)
-    cp.out <- e.divisive(matrix(residuals_ts), R = R, sig.lvl = alpha)
+    alpha         <- 0.05
+    R             <- ceiling(20 / alpha)
+    cp.out        <- e.divisive(matrix(ts_complete), R = R, sig.lvl = alpha)
     changepoint.n <- length(which(cp.out$p.values < alpha))
   }, error = function(e) NA)
   
-  # ========== STORE RESULTS ==========
+  ## --------------------------------
+  # Store Results -------------------
   
-  # Create diagnostic test row
   results_diag[[i]] <- data.frame(
-    uuid = uuid,
-    emotion = emotion,
-    # ts = c(ts),
-    n = length(residuals_ts),
-    ljung_box.p = ljung_box.p,
-    arch_lm.p = arch_lm.p,
+    uuid           = uuid,
+    emotion        = emotion,
+    n              = length(residuals_ts),
+    ljung_box.p    = ljung_box.p,
+    arch_lm.p      = arch_lm.p,
     shapiro_wilk.p = shapiro_wilk.p,
-    BDS.p = BDS.p,
+    BDS.p          = BDS.p,
     stringsAsFactors = FALSE
   )
   
-  row.names(diag_row) <- NULL
-  
-  # Create complexity measures row
   results_complex[[i]] <- data.frame(
-    uuid = uuid,
-    emotion = emotion,
-    # ts = ts,
-    n = length(residuals_ts),
-    edf.lag = edf.lag,
-    edf.t = edf.t,
-    E_opt = E_opt,
-    theta_opt = theta_opt,
+    uuid          = uuid,
+    emotion       = emotion,
+    n             = length(residuals_ts),
+    edf.lag       = edf.lag,
+    edf.t         = edf.t,
+    E_opt         = E_opt,
+    theta_opt     = theta_opt,
     changepoint.n = changepoint.n,
-    BDS.p = BDS.p,
+    BDS.p         = BDS.p,
     stringsAsFactors = FALSE
   )
 }
-
-
 
 # After the loop, bind all rows at once
 results_diag <- do.call(rbind, results_diag)
@@ -491,8 +415,8 @@ rownames(results_diag) <- NULL
 rownames(results_complex) <- NULL
 
 # Save dataframes
-saveRDS(results_diag, file = "results_diag.rds")
-saveRDS(results_complex, file = "results_complex.rds")
+saveRDS(results_diag, file = "results_diag_02-06.rds")
+saveRDS(results_complex, file = "results_complex_02-06.rds")
 
 
 ## --------------------------------
@@ -502,7 +426,7 @@ saveRDS(results_complex, file = "results_complex.rds")
 ## --------------------------------
 # Validating BDS Test -------------
 
-# Conduct Chi square tests to test whether rows with signficant BDS test are more 
+# Conduct Chi square tests to test whether rows with signficant BDS test are more
 # likely to have significant Ljung-Box, ARCH LM, and Shapiro-Wilk tests.
 
 # Create binary indicators for significance (p < 0.05)
@@ -533,7 +457,7 @@ chi_shapiro # non-significant
 ## --------------------------------
 # Complexity Markers --------------
 
-# Conduct Mann-Whitney U tests to test whether rows that are significant on the 
+# Conduct Mann-Whitney U tests to test whether rows that are significant on the
 # BDS test differ in their values from rows that are non-significant
 
 # Create binary indicator for BDS significance
@@ -569,7 +493,8 @@ summary_stats <- results_complex %>%
   )
 
 
-# ========== MANN-WHITNEY U TESTS ==========
+## --------------------------------
+# Mann-Whitney U Tests ------------
 
 mw_edf_lag <- wilcox.test(
   results_complex$edf.lag[results_complex$BDS_sig == TRUE],
@@ -589,12 +514,12 @@ mw_edf_t <- wilcox.test(
   results_complex$edf.t[results_complex$BDS_sig == FALSE],
   alternative = "two.sided"
 )
-mw_edf_t # non-significant
+mw_edf_t # significant
 
 rank_biserial(
   results_complex$edf.t[results_complex$BDS_sig == TRUE],
   results_complex$edf.t[results_complex$BDS_sig == FALSE]
-) # r < 0.01
+) # r < 0.31
 
 
 mw_theta_opt <- wilcox.test(
@@ -607,7 +532,7 @@ mw_theta_opt # non-significant
 rank_biserial(
   results_complex$theta_opt[results_complex$BDS_sig == TRUE],
   results_complex$theta_opt[results_complex$BDS_sig == FALSE]
-) # r = -0.04
+) # r = 0.04
 
 
 mw_changepoint <- wilcox.test(
@@ -620,11 +545,4 @@ mw_changepoint # significant
 rank_biserial(
   results_complex$changepoint.n[results_complex$BDS_sig == TRUE],
   results_complex$changepoint.n[results_complex$BDS_sig == FALSE]
-) # r = 0.16
-
-## --------------------------------
-# EXPLORE: /WO MEASUREMENT ERROR CORRECTION
-## --------------------------------
-
-# Iterate over results
-
+) # r = 0.30

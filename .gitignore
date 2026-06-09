@@ -47,3 +47,8 @@ po/*~
 
 # RStudio Connect folder
 rsconnect/
+
+# other folders and files
+ar-residual-diagnostics/old/
+ar-residual-diagnostics/Schuurman-et-al-2015
+ar-residual-diagnostics/data_FEEL_study_1.csv
